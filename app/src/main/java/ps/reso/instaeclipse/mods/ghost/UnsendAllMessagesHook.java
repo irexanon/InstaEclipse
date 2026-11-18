@@ -166,14 +166,71 @@ public class UnsendAllMessagesHook {
     private static final Map<View, Boolean> sWatchedDecorViews =
             Collections.synchronizedMap(new java.util.WeakHashMap<>());
 
+    private static final List<Method> sNativeUnsendMethods = Collections.synchronizedList(new ArrayList<>());
+    private static volatile Object sNativeUnsendDispatcher = null;
+    private static volatile String sLastObservedThreadQuery = null;
+
     // ── Install ──────────────────────────────────────────────────────────────
 
     public void install(DexKitBridge bridge, ClassLoader classLoader) {
         hookInboxSummariesAndStore(bridge, classLoader);
+        hookNativeUnsendMethods(bridge, classLoader);
         hookInboxTouchAndLongPress(classLoader);
         hookMenuAttachmentAndDialogs(classLoader);
         FeatureStatusTracker.setHooked("UnsendAllMessages");
         ModuleLog.line("(IE|UnsendAll) ✅ installed");
+    }
+
+    /**
+     * Resolves Instagram's internal Direct message unsend methods via DexKit so we can invoke
+     * them directly through Instagram's own Tigon/Iris/Armadillo pipeline in addition to REST.
+     */
+    private void hookNativeUnsendMethods(DexKitBridge bridge, ClassLoader classLoader) {
+        try {
+            String[] anchors = {
+                    "direct_v2/threads/%s/items/%s/delete/",
+                    "original_message_client_context",
+                    "unsend_message"
+            };
+            Set<Method> found = new LinkedHashSet<>();
+            for (String anchor : anchors) {
+                try {
+                    for (MethodData md : bridge.findMethod(FindMethod.create()
+                            .matcher(MethodMatcher.create().usingStrings(anchor)))) {
+                        try {
+                            Method m = md.getMethodInstance(classLoader);
+                            m.setAccessible(true);
+                            found.add(m);
+                        } catch (Throwable ignored) {}
+                    }
+                } catch (Throwable ignored) {}
+            }
+
+            XC_MethodHook spy = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (param.thisObject != null) sNativeUnsendDispatcher = param.thisObject;
+                    if (sUserSession == null && param.args != null) {
+                        for (Object a : param.args) {
+                            if (a != null && a.getClass().getName().equals(USER_SESSION_CLASS)) {
+                                sUserSession = a;
+                                break;
+                            }
+                        }
+                    }
+                }
+            };
+
+            for (Method m : found) {
+                sNativeUnsendMethods.add(m);
+                try { XposedBridge.hookMethod(m, spy); } catch (Throwable ignored) {}
+                ModuleLog.line("(IE|UnsendAll) ✅ native unsend candidate: "
+                        + m.getDeclaringClass().getName() + "." + m.getName()
+                        + " params=" + java.util.Arrays.toString(m.getParameterTypes()));
+            }
+        } catch (Throwable t) {
+            ModuleLog.line("(IE|UnsendAll) ⚠️ hookNativeUnsendMethods: " + t.getMessage());
+        }
     }
 
     // ── 1. Capture Auth Headers & Current User ID from TigonServiceLayer ─────
@@ -185,9 +242,19 @@ public class UnsendAllMessagesHook {
     public static void captureSessionFromTigon(Object tigonLayer, Object requestObj, URI uri) {
         try {
             if (uri == null || uri.getHost() == null || !uri.getHost().contains("i.instagram.com")) return;
+            String path = uri.getPath();
+            if (path != null && path.startsWith("/api/v1/direct_v2/threads/")) {
+                String q = uri.getRawQuery();
+                if (q != null && !q.isEmpty() && !path.endsWith("/delete/")) {
+                    sLastObservedThreadQuery = q;
+                }
+                if (path.endsWith("/delete/")) {
+                    ModuleLog.line("(IE|UnsendAll|Tigon) observed native delete URI=" + uri);
+                }
+            }
             long now = SystemClock.uptimeMillis();
             if (sCurrentUserId != null && sCapturedHeaders.containsKey("Authorization")
-                    && (now - sLastHeaderCaptureMs) < 45_000L) {
+                    && (now - sLastHeaderCaptureMs) < 15_000L) {
                 return;
             }
 
@@ -844,7 +911,8 @@ public class UnsendAllMessagesHook {
             });
         } catch (Throwable ignored) {}
 
-        // Track shown Dialogs so we can inspect Dialog-hosted context menus and dismiss them cleanly
+        // Track shown Dialogs so we can inspect Dialog-hosted context menus, dismiss them cleanly,
+        // and auto-confirm Instagram's native "Unsend message?" confirmation dialog
         try {
             XposedHelpers.findAndHookMethod(Dialog.class, "show", new XC_MethodHook() {
                 @Override
@@ -857,6 +925,7 @@ public class UnsendAllMessagesHook {
                         View decor = w.getDecorView();
                         watchDecorView(decor, true);
                         scheduleMenuCheck(decor, true);
+                        scheduleAutoConfirmUnsendDialog(d, decor);
                     }
                     scheduleAllWindowsSweep();
                 }
@@ -921,6 +990,66 @@ public class UnsendAllMessagesHook {
         }, 45);
         mainHandler.postDelayed(() -> tryInjectIntoMenu(root, isDialogRoot), 150);
         mainHandler.postDelayed(() -> tryInjectIntoMenu(root, isDialogRoot), 320);
+    }
+
+    /**
+     * When Instagram shows its native single-message "Unsend message?" confirmation popup,
+     * automatically click the "Unsend" button so manual/native unsend completes without extra taps.
+     * Never touches InstaEclipse's own "Unsend All Messages?" dialog.
+     */
+    private static void scheduleAutoConfirmUnsendDialog(final Dialog dialog, final View decor) {
+        if (dialog == null || decor == null) return;
+        mainHandler.postDelayed(() -> tryAutoConfirmUnsendDialog(dialog, decor), 40);
+        mainHandler.postDelayed(() -> tryAutoConfirmUnsendDialog(dialog, decor), 120);
+    }
+
+    private static void tryAutoConfirmUnsendDialog(Dialog dialog, View decor) {
+        try {
+            if (!dialog.isShowing() || !(decor instanceof ViewGroup vg)) return;
+            List<TextView> textViews = new ArrayList<>();
+            collectAllTextViews(vg, textViews, 30);
+            boolean hasUnsendPrompt = false;
+            TextView unsendActionBtn = null;
+
+            for (TextView tv : textViews) {
+                CharSequence cs = tv.getText();
+                if (cs == null) continue;
+                String s = cs.toString().trim();
+                String lower = s.toLowerCase(Locale.US);
+                // Never auto-confirm our own "Unsend All Messages?" dialog!
+                if (lower.contains("unsend all")) return;
+                if (lower.contains("unsend message") || lower.contains("unsend this message")
+                        || lower.contains("remove message") || lower.contains("everyone")) {
+                    hasUnsendPrompt = true;
+                }
+                if (lower.equals("unsend")) {
+                    unsendActionBtn = tv;
+                }
+            }
+
+            if (hasUnsendPrompt && unsendActionBtn != null) {
+                View clickTarget = unsendActionBtn;
+                while (clickTarget != null && !clickTarget.isClickable()
+                        && clickTarget.getParent() instanceof View parentView) {
+                    clickTarget = parentView;
+                }
+                if (clickTarget != null && clickTarget.isClickable()) {
+                    ModuleLog.line("(IE|UnsendAll) ✅ auto-confirmed native Unsend popup");
+                    clickTarget.performClick();
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static void collectAllTextViews(View v, List<TextView> out, int limit) {
+        if (v == null || v.getVisibility() != View.VISIBLE || out.size() >= limit) return;
+        if (v instanceof TextView tv) {
+            out.add(tv);
+        } else if (v instanceof ViewGroup vg) {
+            for (int i = 0; i < vg.getChildCount() && out.size() < limit; i++) {
+                collectAllTextViews(vg.getChildAt(i), out, limit);
+            }
+        }
     }
 
     private static void scheduleAllWindowsSweep() {
@@ -1629,9 +1758,10 @@ public class UnsendAllMessagesHook {
             sLastDeleteError = null;
 
             // 1. Collect any locally cached messages in DirectThreadStore for this thread
-            //    (only used as a fallback if the server scan yields nothing — local IDs can be noisy)
+            Map<String, Object> localMsgById = new LinkedHashMap<>();
             if (sCurrentUserId != null) {
-                collectLocalCachedMessageIds(threadKey, threadId, sCurrentUserId, localCacheIds);
+                collectLocalCachedMessages(threadKey, threadId, sCurrentUserId,
+                        localCacheIds, clientContexts, localMsgById);
             }
 
             // 2. Paginate through the entire server thread history
@@ -1659,7 +1789,8 @@ public class UnsendAllMessagesHook {
                 String viewerId = optIdString(thread, "viewer_id");
                 if (sCurrentUserId == null && !viewerId.isEmpty()) {
                     sCurrentUserId = viewerId;
-                    collectLocalCachedMessageIds(threadKey, threadId, sCurrentUserId, localCacheIds);
+                    collectLocalCachedMessages(threadKey, threadId, sCurrentUserId,
+                            localCacheIds, clientContexts, localMsgById);
                 }
                 String myUid = !viewerId.isEmpty() ? viewerId : sCurrentUserId;
 
@@ -1708,7 +1839,8 @@ public class UnsendAllMessagesHook {
                 allMyMessageIds.addAll(localCacheIds);
             }
             ModuleLog.line("(IE|UnsendAll) thread=" + threadId + " myUid=" + sCurrentUserId
-                    + " toUnsend=" + allMyMessageIds.size() + " withCtx=" + clientContexts.size());
+                    + " toUnsend=" + allMyMessageIds.size() + " withCtx=" + clientContexts.size()
+                    + " headers=" + sCapturedHeaders.keySet());
 
             if (cancelled.get()) {
                 finishOnUi(ctx, progressDialog, R.string.ig_unsend_all_cancelled, totalUnsent);
@@ -1746,15 +1878,27 @@ public class UnsendAllMessagesHook {
                     statusView.setText(s);
                 });
 
-                boolean ok = deleteThreadItemOnServer(threadId, itemId, clientContexts.get(itemId), cancelled);
-                if (ok) {
+                try { KeepUnsentMessagesHook.allowAndPurgeSelfUnsent(itemId); } catch (Throwable ignored) {}
+
+                String cc = clientContexts.get(itemId);
+                Object msgObj = localMsgById.get(itemId);
+
+                // Try native Instagram unsend invocation first (works across E2EE & standard)
+                boolean nativeInvoked = invokeNativeUnsend(threadKey, threadId, itemId, cc, msgObj);
+
+                // Also call REST delete endpoint with real item_id (and fallback to cc if needed)
+                boolean restOk = deleteThreadItemOnServer(threadId, itemId, cc, cancelled);
+                if (!restOk && cc != null && !cc.equals(itemId)) {
+                    // In case the two IDs were swapped on a cached model, try the other numeric ID
+                    restOk = deleteThreadItemOnServer(threadId, cc, itemId, cancelled);
+                }
+
+                if (restOk || nativeInvoked) {
                     totalUnsent++;
                     consecutiveFailures = 0;
-                    try { KeepUnsentMessagesHook.allowAndPurgeSelfUnsent(itemId); } catch (Throwable ignored) {}
                     try { removeMessageFromLocalStore(threadKey, threadId, itemId); } catch (Throwable ignored) {}
                 } else {
                     consecutiveFailures++;
-                    // Nothing has worked so far — stop hammering the API and report the reason.
                     if (totalUnsent == 0 && consecutiveFailures >= 5) {
                         ModuleLog.line("(IE|UnsendAll) ❌ aborting after 5 consecutive failures: " + sLastDeleteError);
                         break;
@@ -1805,14 +1949,31 @@ public class UnsendAllMessagesHook {
     // ── 6. Instagram Direct REST API Calls (GET Thread & POST Delete Item) ───
 
     private static String fetchThreadPageJson(String threadId, String cursor, AtomicBoolean cancelled) {
-        for (int attempt = 0; attempt < 3 && !cancelled.get(); attempt++) {
+        String[] queryVariants = new String[]{
+                sLastObservedThreadQuery != null && !sLastObservedThreadQuery.contains("cursor=")
+                        ? sLastObservedThreadQuery
+                        : "visual_message_return_type=unseen&direction=older&seq_id=40065&limit=20",
+                "visual_message_return_type=unseen&limit=20",
+                ""
+        };
+
+        for (int qIdx = 0; qIdx < queryVariants.length && !cancelled.get(); qIdx++) {
+            String baseQuery = queryVariants[qIdx];
             HttpURLConnection conn = null;
             try {
                 StringBuilder urlSb = new StringBuilder("https://i.instagram.com/api/v1/direct_v2/threads/")
-                        .append(threadId)
-                        .append("/?visual_message_return_type=unseen&direction=older");
+                        .append(threadId).append("/");
+                boolean hasQuery = false;
+                if (baseQuery != null && !baseQuery.isEmpty()) {
+                    urlSb.append("?").append(baseQuery);
+                    hasQuery = true;
+                }
                 if (cursor != null && !cursor.isEmpty()) {
-                    urlSb.append("&cursor=").append(URLEncoder.encode(cursor, "UTF-8"));
+                    urlSb.append(hasQuery ? "&" : "?")
+                            .append("cursor=").append(URLEncoder.encode(cursor, "UTF-8"));
+                    if (baseQuery == null || !baseQuery.contains("direction=")) {
+                        urlSb.append("&direction=older");
+                    }
                 }
 
                 conn = (HttpURLConnection) new URL(urlSb.toString()).openConnection();
@@ -1822,18 +1983,19 @@ public class UnsendAllMessagesHook {
                 applyInstagramHeaders(conn);
 
                 int code = conn.getResponseCode();
-                if (code == 200) {
-                    return readStream(conn);
-                } else if (code == 429 || code >= 500) {
-                    ModuleLog.line("(IE|UnsendAll) ⚠️ GET thread HTTP " + code + ", backing off");
-                    sleepInterruptibly(2500L * (attempt + 1), cancelled);
-                } else {
-                    ModuleLog.line("(IE|UnsendAll) ❌ GET thread HTTP " + code);
-                    return null;
+                String resp = readStreamSafe(conn, code);
+                if (code == 200 && resp != null && resp.contains("\"thread\"")) {
+                    return resp;
+                }
+                String snippet = resp == null ? "" : (resp.length() > 260 ? resp.substring(0, 260) : resp);
+                ModuleLog.line("(IE|UnsendAll) ⚠️ GET thread qVariant=" + qIdx
+                        + " HTTP " + code + " body=" + snippet);
+                if (code == 429 || code >= 500) {
+                    sleepInterruptibly(2500L, cancelled);
                 }
             } catch (Throwable t) {
                 ModuleLog.line("(IE|UnsendAll) ⚠️ GET thread exception: " + t.getMessage());
-                sleepInterruptibly(1500L, cancelled);
+                sleepInterruptibly(1000L, cancelled);
             } finally {
                 if (conn != null) conn.disconnect();
             }
@@ -1900,7 +2062,6 @@ public class UnsendAllMessagesHook {
             if (!o.has("status")) return true;
             return "ok".equalsIgnoreCase(o.optString("status"));
         } catch (Throwable ignored) {
-            // Not JSON (unexpected) — treat as success only if it doesn't look like an error
             String lower = body.toLowerCase(Locale.US);
             return !lower.contains("fail") && !lower.contains("error");
         }
@@ -1913,6 +2074,10 @@ public class UnsendAllMessagesHook {
             String m = o.optString("message", "");
             if (m.isEmpty()) m = o.optString("error_title", "");
             if (m.isEmpty()) m = o.optString("error_type", "");
+            if (m.isEmpty() && o.optJSONObject("content") != null) {
+                JSONObject c = o.optJSONObject("content");
+                m = c.optString("status", "");
+            }
             if (!m.isEmpty()) return m;
         } catch (Throwable ignored) {}
         String b = body.replace('\n', ' ').trim();
@@ -1921,9 +2086,8 @@ public class UnsendAllMessagesHook {
 
     private static boolean deleteThreadItemOnServer(String threadId, String itemId, String clientContext,
                                                     AtomicBoolean cancelled) {
-        // Variant 0: signed_body (what the official app sends); variant 1: plain form fallback.
         int variant = 0;
-        for (int attempt = 0; attempt < 4 && !cancelled.get(); attempt++) {
+        for (int attempt = 0; attempt < 3 && !cancelled.get(); attempt++) {
             HttpURLConnection conn = null;
             try {
                 String urlStr = "https://i.instagram.com/api/v1/direct_v2/threads/"
@@ -1947,6 +2111,7 @@ public class UnsendAllMessagesHook {
                 String snippet = resp == null ? "" : (resp.length() > 300 ? resp.substring(0, 300) : resp);
 
                 if (code >= 200 && code < 300 && isOkResponseBody(resp)) {
+                    ModuleLog.line("(IE|UnsendAll) ✅ DELETE item=" + itemId + " HTTP " + code);
                     return true;
                 }
 
@@ -1975,7 +2140,14 @@ public class UnsendAllMessagesHook {
 
     private static void applyInstagramHeaders(HttpURLConnection conn) {
         for (Map.Entry<String, String> e : sCapturedHeaders.entrySet()) {
-            conn.setRequestProperty(e.getKey(), e.getValue());
+            String k = e.getKey();
+            // Never forward per-request Bloks or GraphQL friendly names onto Direct REST calls
+            String lower = k.toLowerCase(Locale.US);
+            if (lower.equals("x-fb-friendly-name") || lower.equals("x-bloks-prism-button-version")
+                    || lower.equals("x-root-field-name")) {
+                continue;
+            }
+            conn.setRequestProperty(k, e.getValue());
         }
         conn.setRequestProperty("Accept-Encoding", "gzip");
         if (getCapturedHeaderIgnoreCase("X-IG-App-ID") == null) {
@@ -2039,10 +2211,86 @@ public class UnsendAllMessagesHook {
         }
     }
 
-    // ── 7. Local DirectThreadStore Inspection & Cleanup ──────────────────────
+    // ── 7. Local DirectThreadStore Inspection & Native Unsend Invocation ─────
 
-    private static void collectLocalCachedMessageIds(Object threadKey, String threadId,
-                                                     String myUserId, Set<String> outIds) {
+    /**
+     * Attempts to invoke Instagram's internal Direct unsend method(s) discovered by DexKit.
+     * Supports static builders/senders taking (UserSession, DirectThreadKey/String, itemId, clientContext, ...).
+     */
+    private static boolean invokeNativeUnsend(Object threadKey, String threadId,
+                                              String itemId, String clientContext, Object msgObj) {
+        if (sNativeUnsendMethods.isEmpty()) return false;
+        Object dtk = threadKey != null ? threadKey : sThreadKeyById.get(threadId);
+        Object session = sUserSession;
+        String cc = (clientContext != null && !clientContext.isEmpty()) ? clientContext : UUID.randomUUID().toString();
+
+        for (Method m : sNativeUnsendMethods) {
+            try {
+                boolean isStatic = Modifier.isStatic(m.getModifiers());
+                Object target = isStatic ? null : sNativeUnsendDispatcher;
+                if (!isStatic && target == null) continue;
+
+                Class<?>[] pTypes = m.getParameterTypes();
+                Object[] args = new Object[pTypes.length];
+                int strIdx = 0;
+                boolean matched = true;
+
+                for (int i = 0; i < pTypes.length; i++) {
+                    Class<?> pt = pTypes[i];
+                    String pName = pt.getName();
+                    if (pName.equals(USER_SESSION_CLASS) || pName.endsWith(".UserSession")) {
+                        if (session == null) { matched = false; break; }
+                        args[i] = session;
+                    } else if (pName.equals(DTK_CLASS) || pName.contains("DirectThreadKey")) {
+                        if (dtk == null) { matched = false; break; }
+                        args[i] = dtk;
+                    } else if (msgObj != null && pt.isAssignableFrom(msgObj.getClass()) && pt != Object.class) {
+                        args[i] = msgObj;
+                    } else if (pt == String.class) {
+                        // Order for String params on Direct delete builders:
+                        // If DirectThreadKey wasn't a param, first String is threadId, then itemId, then clientContext.
+                        boolean hasDtkParam = false;
+                        for (Class<?> c : pTypes) {
+                            if (c.getName().contains("DirectThreadKey")) { hasDtkParam = true; break; }
+                        }
+                        if (!hasDtkParam) {
+                            if (strIdx == 0) args[i] = threadId;
+                            else if (strIdx == 1) args[i] = itemId;
+                            else if (strIdx == 2) args[i] = cc;
+                            else args[i] = "direct_thread";
+                        } else {
+                            if (strIdx == 0) args[i] = itemId;
+                            else if (strIdx == 1) args[i] = cc;
+                            else args[i] = "direct_thread";
+                        }
+                        strIdx++;
+                    } else if (pt == boolean.class || pt == Boolean.class) {
+                        args[i] = false;
+                    } else if (pt == int.class || pt == Integer.class) {
+                        args[i] = 0;
+                    } else if (pt == long.class || pt == Long.class) {
+                        args[i] = 0L;
+                    } else {
+                        args[i] = null;
+                    }
+                }
+
+                if (!matched || strIdx == 0) continue;
+
+                Object res = m.invoke(target, args);
+                ModuleLog.line("(IE|UnsendAll) ✅ invoked native unsend "
+                        + m.getDeclaringClass().getName() + "." + m.getName()
+                        + " -> " + (res != null ? res.getClass().getName() : "void"));
+                return true;
+            } catch (Throwable ignored) {}
+        }
+        return false;
+    }
+
+    private static void collectLocalCachedMessages(Object threadKey, String threadId,
+                                                   String myUserId, Set<String> outIds,
+                                                   Map<String, String> outClientContexts,
+                                                   Map<String, Object> outMsgObjects) {
         try {
             Object store = sDirectThreadStore;
             Object dtk = threadKey != null ? threadKey : sThreadKeyById.get(threadId);
@@ -2061,7 +2309,8 @@ public class UnsendAllMessagesHook {
                             Object listObj = f.get(entry);
                             if (!(listObj instanceof List<?> msgList) || msgList.isEmpty()) continue;
                             for (Object msg : new ArrayList<>(msgList)) {
-                                extractMyItemIdFromMessageModel(msg, myUserId, threadId, outIds);
+                                extractMyItemFromMessageModel(msg, myUserId, threadId,
+                                        outIds, outClientContexts, outMsgObjects);
                             }
                         }
                     }
@@ -2070,11 +2319,23 @@ public class UnsendAllMessagesHook {
         } catch (Throwable ignored) {}
     }
 
-    private static void extractMyItemIdFromMessageModel(Object msg, String myUserId,
-                                                        String threadId, Set<String> outIds) {
+    /**
+     * Extracts the server item_id and client_context from a cached Direct message model.
+     * Note: Instagram Direct message models hold TWO long numeric Strings:
+     *   - item_id (29-40 digits, e.g. 340282366841710300949128...)
+     *   - client_context (18-22 digits, e.g. 7496443656675030921)
+     * Calling the REST delete endpoint with client_context in the URL fails with HTTP 400
+     * (error_code 4415001). We always pick the longest numeric String (25+ digits) as item_id
+     * and the shorter (18-22 digits) as client_context.
+     */
+    private static void extractMyItemFromMessageModel(Object msg, String myUserId,
+                                                      String threadId, Set<String> outIds,
+                                                      Map<String, String> outClientContexts,
+                                                      Map<String, Object> outMsgObjects) {
         if (msg == null) return;
         boolean sentByMe = false;
-        List<String> candidateItemIds = new ArrayList<>();
+        List<String> longIds = new ArrayList<>();   // 25..45 digits (server item_id)
+        List<String> shortIds = new ArrayList<>();  // 18..24 digits (client_context / mutation token)
 
         for (Class<?> c = msg.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
             for (Field f : c.getDeclaredFields()) {
@@ -2082,19 +2343,33 @@ public class UnsendAllMessagesHook {
                 try {
                     f.setAccessible(true);
                     String val = (String) f.get(msg);
-                    if (val == null) continue;
+                    if (val == null || val.isEmpty()) continue;
                     if (val.equals(myUserId)) {
                         sentByMe = true;
-                    } else if (val.length() >= 18 && val.length() <= 40
-                            && !val.equals(threadId) && val.chars().allMatch(Character::isDigit)) {
-                        candidateItemIds.add(val);
+                    } else if (!val.equals(threadId) && val.length() >= 18 && val.length() <= 45
+                            && val.chars().allMatch(Character::isDigit)) {
+                        if (val.length() >= 25) {
+                            if (!longIds.contains(val)) longIds.add(val);
+                        } else {
+                            if (!shortIds.contains(val)) shortIds.add(val);
+                        }
                     }
                 } catch (Throwable ignored) {}
             }
         }
 
-        if (sentByMe && !candidateItemIds.isEmpty()) {
-            outIds.add(candidateItemIds.get(0));
+        if (!sentByMe) return;
+
+        String itemId = !longIds.isEmpty() ? longIds.get(0) : (!shortIds.isEmpty() ? shortIds.get(0) : null);
+        String clientCtx = !shortIds.isEmpty() ? shortIds.get(0)
+                : (longIds.size() > 1 ? longIds.get(1) : null);
+
+        if (itemId != null) {
+            outIds.add(itemId);
+            if (clientCtx != null && !clientCtx.equals(itemId)) {
+                outClientContexts.put(itemId, clientCtx);
+            }
+            outMsgObjects.put(itemId, msg);
         }
     }
 

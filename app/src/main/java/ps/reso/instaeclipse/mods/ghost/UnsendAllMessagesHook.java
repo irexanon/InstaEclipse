@@ -159,8 +159,12 @@ public class UnsendAllMessagesHook {
     private static final String[] THREAD_MENU_KEYWORDS = {
             "delete", "mute", "unmute", "pin", "unpin", "flag", "unflag",
             "mark as unread", "mark as read", "unread", "move to general",
-            "move to primary", "leave", "restrict", "hide"
+            "move to primary", "leave", "restrict", "hide", "silent",
+            "notification", "vanish", "archive"
     };
+
+    private static final Map<View, Boolean> sWatchedDecorViews =
+            Collections.synchronizedMap(new java.util.WeakHashMap<>());
 
     // ── Install ──────────────────────────────────────────────────────────────
 

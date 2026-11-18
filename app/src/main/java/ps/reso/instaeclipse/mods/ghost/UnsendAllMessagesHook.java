@@ -1624,10 +1624,14 @@ public class UnsendAllMessagesHook {
             }
 
             LinkedHashSet<String> allMyMessageIds = new LinkedHashSet<>();
+            LinkedHashSet<String> localCacheIds = new LinkedHashSet<>();
+            Map<String, String> clientContexts = new java.util.HashMap<>();
+            sLastDeleteError = null;
 
             // 1. Collect any locally cached messages in DirectThreadStore for this thread
+            //    (only used as a fallback if the server scan yields nothing — local IDs can be noisy)
             if (sCurrentUserId != null) {
-                collectLocalCachedMessageIds(threadKey, threadId, sCurrentUserId, allMyMessageIds);
+                collectLocalCachedMessageIds(threadKey, threadId, sCurrentUserId, localCacheIds);
             }
 
             // 2. Paginate through the entire server thread history
@@ -1641,17 +1645,23 @@ public class UnsendAllMessagesHook {
                 String jsonStr = fetchThreadPageJson(threadId, cursor, cancelled);
                 if (jsonStr == null || jsonStr.isEmpty()) break;
 
-                JSONObject root = new JSONObject(jsonStr);
-                JSONObject thread = root.optJSONObject("thread");
+                JSONObject thread;
+                try {
+                    JSONObject root = new JSONObject(jsonStr);
+                    thread = root.optJSONObject("thread");
+                } catch (Throwable parseErr) {
+                    ModuleLog.line("(IE|UnsendAll) ⚠️ page parse error: " + parseErr);
+                    break;
+                }
                 if (thread == null) break;
 
                 // Resolve viewer_id from thread payload if sCurrentUserId wasn't known yet
                 String viewerId = optIdString(thread, "viewer_id");
                 if (sCurrentUserId == null && !viewerId.isEmpty()) {
                     sCurrentUserId = viewerId;
-                    collectLocalCachedMessageIds(threadKey, threadId, sCurrentUserId, allMyMessageIds);
+                    collectLocalCachedMessageIds(threadKey, threadId, sCurrentUserId, localCacheIds);
                 }
-                String myUid = sCurrentUserId != null ? sCurrentUserId : viewerId;
+                String myUid = !viewerId.isEmpty() ? viewerId : sCurrentUserId;
 
                 JSONArray items = thread.optJSONArray("items");
                 if (items != null && myUid != null && !myUid.isEmpty()) {
@@ -1666,6 +1676,8 @@ public class UnsendAllMessagesHook {
                         String itemId = optIdString(item, "item_id");
                         if (!itemId.isEmpty() && myUid.equals(senderId)) {
                             allMyMessageIds.add(itemId);
+                            String cc = optIdString(item, "client_context");
+                            if (!cc.isEmpty() && !"null".equals(cc)) clientContexts.put(itemId, cc);
                         }
                     }
                 }
@@ -1689,6 +1701,14 @@ public class UnsendAllMessagesHook {
                 cursor = nextCursor;
                 sleepInterruptibly(220, cancelled);
             }
+
+            if (allMyMessageIds.isEmpty() && !localCacheIds.isEmpty()) {
+                ModuleLog.line("(IE|UnsendAll) server scan empty, falling back to "
+                        + localCacheIds.size() + " local cache ids");
+                allMyMessageIds.addAll(localCacheIds);
+            }
+            ModuleLog.line("(IE|UnsendAll) thread=" + threadId + " myUid=" + sCurrentUserId
+                    + " toUnsend=" + allMyMessageIds.size() + " withCtx=" + clientContexts.size());
 
             if (cancelled.get()) {
                 finishOnUi(ctx, progressDialog, R.string.ig_unsend_all_cancelled, totalUnsent);
@@ -1714,6 +1734,7 @@ public class UnsendAllMessagesHook {
             });
 
             int index = 0;
+            int consecutiveFailures = 0;
             for (String itemId : allMyMessageIds) {
                 if (cancelled.get()) break;
                 index++;
@@ -1725,29 +1746,45 @@ public class UnsendAllMessagesHook {
                     statusView.setText(s);
                 });
 
-                boolean ok = deleteThreadItemOnServer(threadId, itemId, cancelled);
+                boolean ok = deleteThreadItemOnServer(threadId, itemId, clientContexts.get(itemId), cancelled);
                 if (ok) {
                     totalUnsent++;
-                    KeepUnsentMessagesHook.allowAndPurgeSelfUnsent(itemId);
-                    removeMessageFromLocalStore(threadKey, threadId, itemId);
+                    consecutiveFailures = 0;
+                    try { KeepUnsentMessagesHook.allowAndPurgeSelfUnsent(itemId); } catch (Throwable ignored) {}
+                    try { removeMessageFromLocalStore(threadKey, threadId, itemId); } catch (Throwable ignored) {}
+                } else {
+                    consecutiveFailures++;
+                    // Nothing has worked so far — stop hammering the API and report the reason.
+                    if (totalUnsent == 0 && consecutiveFailures >= 5) {
+                        ModuleLog.line("(IE|UnsendAll) ❌ aborting after 5 consecutive failures: " + sLastDeleteError);
+                        break;
+                    }
                 }
 
-                sleepInterruptibly(200, cancelled);
+                sleepInterruptibly(250, cancelled);
             }
 
             if (cancelled.get()) {
                 finishOnUi(ctx, progressDialog, R.string.ig_unsend_all_cancelled, totalUnsent);
+            } else if (totalUnsent < totalToUnsend && sLastDeleteError != null) {
+                final int done = totalUnsent;
+                final String err = sLastDeleteError;
+                mainHandler.post(() -> {
+                    try { progressDialog.dismiss(); } catch (Throwable ignored) {}
+                    Toast.makeText(ctx, "Unsent " + done + " / " + totalToUnsend
+                            + " — failed: " + err, Toast.LENGTH_LONG).show();
+                });
             } else {
                 finishOnUi(ctx, progressDialog, R.string.ig_unsend_all_completed, totalUnsent);
             }
         } catch (Throwable t) {
             ModuleLog.line("(IE|UnsendAll) ❌ worker error: " + t);
             final int count = totalUnsent;
+            final String err = t.getClass().getSimpleName() + ": " + t.getMessage();
             mainHandler.post(() -> {
                 try { progressDialog.dismiss(); } catch (Throwable ignored) {}
-                String msg = I18n.t(ctx, R.string.ig_unsend_all_completed, count);
-                if (msg.isEmpty()) msg = "Unsent " + count + " messages";
-                Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show();
+                Toast.makeText(ctx, "Unsent " + count + " messages — error: " + err,
+                        Toast.LENGTH_LONG).show();
             });
         }
     }
@@ -1804,8 +1841,89 @@ public class UnsendAllMessagesHook {
         return null;
     }
 
-    private static boolean deleteThreadItemOnServer(String threadId, String itemId, AtomicBoolean cancelled) {
-        for (int attempt = 0; attempt < 3 && !cancelled.get(); attempt++) {
+    /** Last delete failure description (HTTP code + server message), for user feedback. */
+    private static volatile String sLastDeleteError = null;
+
+    private static String getCapturedHeaderIgnoreCase(String name) {
+        String v = sCapturedHeaders.get(name);
+        if (v != null && !v.isEmpty()) return v;
+        for (Map.Entry<String, String> e : sCapturedHeaders.entrySet()) {
+            if (e.getKey().equalsIgnoreCase(name)) return e.getValue();
+        }
+        return null;
+    }
+
+    private static String extractCookieValue(String cookie, String name) {
+        if (cookie == null) return null;
+        for (String part : cookie.split(";")) {
+            String p = part.trim();
+            if (p.startsWith(name + "=")) {
+                String v = p.substring(name.length() + 1).trim();
+                return v.isEmpty() ? null : v;
+            }
+        }
+        return null;
+    }
+
+    private static String buildDeleteBody(boolean signed, String clientContext) throws Exception {
+        String uuid = getCapturedHeaderIgnoreCase("X-IG-Device-ID");
+        if (uuid == null || uuid.isEmpty()) uuid = UUID.randomUUID().toString();
+        String csrf = extractCookieValue(getCapturedHeaderIgnoreCase("Cookie"), "csrftoken");
+
+        if (signed) {
+            JSONObject json = new JSONObject();
+            json.put("is_shh_mode", "0");
+            json.put("send_attribution", "direct_thread");
+            json.put("_uuid", uuid);
+            if (csrf != null) json.put("_csrftoken", csrf);
+            if (clientContext != null && !clientContext.isEmpty()) {
+                json.put("original_message_client_context", clientContext);
+            }
+            return "signed_body=SIGNATURE." + URLEncoder.encode(json.toString(), "UTF-8");
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("is_shh_mode=0&send_attribution=direct_thread");
+        sb.append("&_uuid=").append(URLEncoder.encode(uuid, "UTF-8"));
+        if (csrf != null) sb.append("&_csrftoken=").append(URLEncoder.encode(csrf, "UTF-8"));
+        if (clientContext != null && !clientContext.isEmpty()) {
+            sb.append("&original_message_client_context=")
+                    .append(URLEncoder.encode(clientContext, "UTF-8"));
+        }
+        return sb.toString();
+    }
+
+    private static boolean isOkResponseBody(String body) {
+        if (body == null || body.trim().isEmpty()) return true;
+        try {
+            JSONObject o = new JSONObject(body);
+            if (!o.has("status")) return true;
+            return "ok".equalsIgnoreCase(o.optString("status"));
+        } catch (Throwable ignored) {
+            // Not JSON (unexpected) — treat as success only if it doesn't look like an error
+            String lower = body.toLowerCase(Locale.US);
+            return !lower.contains("fail") && !lower.contains("error");
+        }
+    }
+
+    private static String shortServerMessage(String body) {
+        if (body == null) return "";
+        try {
+            JSONObject o = new JSONObject(body);
+            String m = o.optString("message", "");
+            if (m.isEmpty()) m = o.optString("error_title", "");
+            if (m.isEmpty()) m = o.optString("error_type", "");
+            if (!m.isEmpty()) return m;
+        } catch (Throwable ignored) {}
+        String b = body.replace('\n', ' ').trim();
+        return b.length() > 120 ? b.substring(0, 120) + "…" : b;
+    }
+
+    private static boolean deleteThreadItemOnServer(String threadId, String itemId, String clientContext,
+                                                    AtomicBoolean cancelled) {
+        // Variant 0: signed_body (what the official app sends); variant 1: plain form fallback.
+        int variant = 0;
+        for (int attempt = 0; attempt < 4 && !cancelled.get(); attempt++) {
             HttpURLConnection conn = null;
             try {
                 String urlStr = "https://i.instagram.com/api/v1/direct_v2/threads/"
@@ -1818,27 +1936,35 @@ public class UnsendAllMessagesHook {
                 applyInstagramHeaders(conn);
                 conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
 
-                String uuid = sCapturedHeaders.get("X-IG-Device-ID");
-                if (uuid == null || uuid.isEmpty()) uuid = UUID.randomUUID().toString();
-                byte[] body = ("_uuid=" + URLEncoder.encode(uuid, "UTF-8") + "&_csrftoken=missing")
-                        .getBytes(StandardCharsets.UTF_8);
+                byte[] body = buildDeleteBody(variant == 0, clientContext).getBytes(StandardCharsets.UTF_8);
                 conn.setFixedLengthStreamingMode(body.length);
                 try (OutputStream os = conn.getOutputStream()) {
                     os.write(body);
                 }
 
                 int code = conn.getResponseCode();
-                if (code >= 200 && code < 300) {
+                String resp = readStreamSafe(conn, code);
+                String snippet = resp == null ? "" : (resp.length() > 300 ? resp.substring(0, 300) : resp);
+
+                if (code >= 200 && code < 300 && isOkResponseBody(resp)) {
                     return true;
-                } else if (code == 429 || code >= 500) {
-                    ModuleLog.line("(IE|UnsendAll) ⚠️ DELETE item HTTP " + code + ", backing off");
+                }
+
+                String msg = shortServerMessage(resp);
+                sLastDeleteError = "HTTP " + code + (msg.isEmpty() ? "" : " " + msg);
+                ModuleLog.line("(IE|UnsendAll) ⚠️ DELETE item=" + itemId + " variant=" + variant
+                        + " HTTP " + code + " body=" + snippet);
+
+                if (code == 429 || code >= 500) {
                     sleepInterruptibly(2500L * (attempt + 1), cancelled);
+                } else if (variant == 0) {
+                    variant = 1; // try plain form once
                 } else {
-                    ModuleLog.line("(IE|UnsendAll) ⚠️ DELETE item HTTP " + code + " for item=" + itemId);
                     return false;
                 }
             } catch (Throwable t) {
-                ModuleLog.line("(IE|UnsendAll) ⚠️ DELETE exception: " + t.getMessage());
+                sLastDeleteError = t.getClass().getSimpleName() + ": " + t.getMessage();
+                ModuleLog.line("(IE|UnsendAll) ⚠️ DELETE exception: " + t);
                 sleepInterruptibly(1500L, cancelled);
             } finally {
                 if (conn != null) conn.disconnect();
@@ -1852,8 +1978,30 @@ public class UnsendAllMessagesHook {
             conn.setRequestProperty(e.getKey(), e.getValue());
         }
         conn.setRequestProperty("Accept-Encoding", "gzip");
-        if (!sCapturedHeaders.containsKey("X-IG-App-ID")) {
+        if (getCapturedHeaderIgnoreCase("X-IG-App-ID") == null) {
             conn.setRequestProperty("X-IG-App-ID", "567067343352427");
+        }
+    }
+
+    /** Reads either the success or error body, never throws. */
+    private static String readStreamSafe(HttpURLConnection conn, int code) {
+        try {
+            InputStream in = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
+            if (in == null) return "";
+            String encoding = conn.getContentEncoding();
+            if (encoding != null && encoding.toLowerCase(Locale.US).contains("gzip")) {
+                in = new GZIPInputStream(in);
+            }
+            try (InputStream stream = in; ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = stream.read(buf)) != -1) {
+                    bos.write(buf, 0, n);
+                }
+                return bos.toString("UTF-8");
+            }
+        } catch (Throwable t) {
+            return "";
         }
     }
 

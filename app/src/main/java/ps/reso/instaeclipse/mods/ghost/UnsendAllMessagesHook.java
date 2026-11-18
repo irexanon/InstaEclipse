@@ -533,32 +533,62 @@ public class UnsendAllMessagesHook {
     // ── 3. Inbox Row Touch & Long-Press Tracking ─────────────────────────────
 
     private void hookInboxTouchAndLongPress(ClassLoader classLoader) {
-        // Track touch-down on inbox_refreshable_thread_list_recyclerview to identify the exact row
-        // under the user's finger regardless of whether the row uses View.OnLongClickListener,
-        // GestureDetector, or Litho/Compose touch handling.
+        // Hook Activity.dispatchTouchEvent so every touch-down in any Activity is captured using
+        // screen coordinates, even when obfuscated RecyclerView subclasses override dispatchTouchEvent
+        // or use GestureDetector for long-presses.
         try {
-            XposedHelpers.findAndHookMethod(ViewGroup.class, "dispatchTouchEvent", MotionEvent.class,
+            XposedHelpers.findAndHookMethod(Activity.class, "dispatchTouchEvent", MotionEvent.class,
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             if (!FeatureFlags.unsendAllMessages) return;
                             if (!(param.args[0] instanceof MotionEvent ev)) return;
-                            if (ev.getActionMasked() != MotionEvent.ACTION_DOWN) return;
+                            int action = ev.getActionMasked();
+                            if (action != MotionEvent.ACTION_DOWN) return;
 
-                            ViewGroup vg = (ViewGroup) param.thisObject;
-                            ensureResourceIds(vg.getContext());
-                            if (sInboxRecyclerId == 0 || vg.getId() != sInboxRecyclerId) return;
+                            Activity act = (Activity) param.thisObject;
+                            watchActivity(act);
+                            ensureResourceIds(act);
 
-                            sLastInboxInteractionMs = SystemClock.uptimeMillis();
-                            View rowView = findDirectChildUnder(vg, ev.getX(), ev.getY());
-                            if (rowView != null) {
-                                captureThreadFromInboxRow(vg, rowView);
+                            Window w = act.getWindow();
+                            if (w == null) return;
+                            View decor = w.getDecorView();
+                            if (!(decor instanceof ViewGroup decorGroup)) return;
+
+                            float rawX = ev.getRawX();
+                            float rawY = ev.getRawY();
+
+                            List<ViewGroup> rvs = new ArrayList<>();
+                            findCandidateRecyclerViewsUnder(decorGroup, rawX, rawY, rvs);
+                            for (ViewGroup rv : rvs) {
+                                View rowView = findDirectChildAtScreenPos(rv, rawX, rawY);
+                                if (rowView != null) {
+                                    sLastInboxInteractionMs = SystemClock.uptimeMillis();
+                                    captureThreadFromInboxRow(rv, rowView);
+                                    break;
+                                }
                             }
                         }
                     });
         } catch (Throwable t) {
-            ModuleLog.line("(IE|UnsendAll) ⚠️ dispatchTouchEvent hook: " + t.getMessage());
+            ModuleLog.line("(IE|UnsendAll) ⚠️ Activity.dispatchTouchEvent hook: " + t.getMessage());
         }
+
+        // Hook GestureDetector.SimpleOnGestureListener.onLongPress to trigger menu sweeps when
+        // Instagram's RecyclerView item touch listener detects a long-press.
+        try {
+            XposedHelpers.findAndHookMethod(
+                    android.view.GestureDetector.SimpleOnGestureListener.class,
+                    "onLongPress", MotionEvent.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (!FeatureFlags.unsendAllMessages) return;
+                            sLastInboxInteractionMs = SystemClock.uptimeMillis();
+                            scheduleAllWindowsSweep();
+                        }
+                    });
+        } catch (Throwable ignored) {}
 
         // Also hook View.performLongClick() as a direct trigger when a row fires standard long-click
         try {
@@ -568,33 +598,69 @@ public class UnsendAllMessagesHook {
                     if (!FeatureFlags.unsendAllMessages) return;
                     View v = (View) param.thisObject;
                     ensureResourceIds(v.getContext());
-                    View inboxRv = sInboxRecyclerId != 0 ? findAncestorById(v, sInboxRecyclerId) : null;
-                    if (inboxRv instanceof ViewGroup rvGroup) {
-                        sLastInboxInteractionMs = SystemClock.uptimeMillis();
+                    sLastInboxInteractionMs = SystemClock.uptimeMillis();
+                    ViewGroup rvGroup = findEnclosingRecyclerView(v);
+                    if (rvGroup != null && !isInsideSheetContainer(rvGroup, rvGroup.getRootView(), false)) {
                         View rowView = v;
                         while (rowView.getParent() != rvGroup && rowView.getParent() instanceof View p) {
                             rowView = p;
                         }
                         captureThreadFromInboxRow(rvGroup, rowView);
                     }
+                    scheduleAllWindowsSweep();
                 }
             });
         } catch (Throwable ignored) {}
     }
 
-    private static View findDirectChildUnder(ViewGroup parent, float x, float y) {
-        try {
-            Method m = parent.getClass().getMethod("findChildViewUnder", float.class, float.class);
-            Object r = m.invoke(parent, x, y);
-            if (r instanceof View v) return v;
-        } catch (Throwable ignored) {}
+    private static void findCandidateRecyclerViewsUnder(ViewGroup root, float rawX, float rawY, List<ViewGroup> out) {
+        if (root == null || root.getVisibility() != View.VISIBLE) return;
+        int id = root.getId();
+        if ((sActionSheetContainerId != 0 && id == sActionSheetContainerId)
+                || (sBottomSheetContainerId != 0 && id == sBottomSheetContainerId)
+                || (sDesignBottomSheetId != 0 && id == sDesignBottomSheetId)) {
+            return; // skip bottom sheet containers when looking for the inbox list
+        }
+        if ((sInboxRecyclerId != 0 && id == sInboxRecyclerId) || isRecyclerViewOrListView(root)) {
+            if (containsScreenPoint(root, rawX, rawY) && root.getChildCount() > 0) {
+                if (sInboxRecyclerId != 0 && id == sInboxRecyclerId) {
+                    out.add(0, root); // prioritize exact inbox RecyclerView ID
+                } else {
+                    out.add(root);
+                }
+            }
+        }
+        for (int i = 0; i < root.getChildCount(); i++) {
+            View c = root.getChildAt(i);
+            if (c instanceof ViewGroup vg && c.getVisibility() == View.VISIBLE) {
+                findCandidateRecyclerViewsUnder(vg, rawX, rawY, out);
+            }
+        }
+    }
 
+    private static View findDirectChildAtScreenPos(ViewGroup parent, float rawX, float rawY) {
         for (int i = parent.getChildCount() - 1; i >= 0; i--) {
             View child = parent.getChildAt(i);
-            if (child.getVisibility() != View.VISIBLE) continue;
-            if (x >= child.getLeft() && x <= child.getRight()
-                    && y >= child.getTop() && y <= child.getBottom()) {
+            if (child == null || child.getVisibility() != View.VISIBLE) continue;
+            if (containsScreenPoint(child, rawX, rawY)) {
                 return child;
+            }
+        }
+        return null;
+    }
+
+    private static boolean containsScreenPoint(View v, float rawX, float rawY) {
+        if (v == null || !v.isShown() || v.getWidth() <= 0 || v.getHeight() <= 0) return false;
+        int[] loc = new int[2];
+        v.getLocationOnScreen(loc);
+        return rawX >= loc[0] && rawX <= (loc[0] + v.getWidth())
+                && rawY >= loc[1] && rawY <= (loc[1] + v.getHeight());
+    }
+
+    private static ViewGroup findEnclosingRecyclerView(View v) {
+        for (android.view.ViewParent p = v.getParent(); p instanceof ViewGroup vg; p = vg.getParent()) {
+            if ((sInboxRecyclerId != 0 && vg.getId() == sInboxRecyclerId) || isRecyclerViewOrListView(vg)) {
+                return vg;
             }
         }
         return null;
@@ -610,11 +676,11 @@ public class UnsendAllMessagesHook {
                 Method getVh = recyclerView.getClass().getMethod("getChildViewHolder", View.class);
                 Object vh = getVh.invoke(recyclerView, rowView);
                 if (vh != null) {
-                    foundKey = findDirectThreadKey(vh, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 5);
+                    foundKey = findDirectThreadKey(vh, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 6);
                     if (foundKey != null) {
                         foundId = extractThreadIdFromKey(foundKey);
                     } else {
-                        foundId = findKnownThreadIdInGraph(vh, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 5);
+                        foundId = findKnownThreadIdInGraph(vh, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 6);
                     }
                 }
             } catch (Throwable ignored) {}
@@ -633,11 +699,11 @@ public class UnsendAllMessagesHook {
                         if (adapter != null) {
                             Object item = getAdapterItemAt(adapter, pos);
                             if (item != null) {
-                                foundKey = findDirectThreadKey(item, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 5);
+                                foundKey = findDirectThreadKey(item, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 6);
                                 if (foundKey != null) {
                                     foundId = extractThreadIdFromKey(foundKey);
                                 } else {
-                                    foundId = findKnownThreadIdInGraph(item, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 5);
+                                    foundId = findKnownThreadIdInGraph(item, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 6);
                                 }
                             }
                         }
@@ -647,17 +713,17 @@ public class UnsendAllMessagesHook {
 
             // Strategy C: Scan rowView itself (tags & fields)
             if (foundId == null) {
-                foundKey = findDirectThreadKey(rowView, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 4);
+                foundKey = findDirectThreadKey(rowView, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 5);
                 if (foundKey != null) {
                     foundId = extractThreadIdFromKey(foundKey);
                 } else {
-                    foundId = findKnownThreadIdInGraph(rowView, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 4);
+                    foundId = findKnownThreadIdInGraph(rowView, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 5);
                 }
             }
 
             // Extract visible title from rowView for display & title-matching fallback
             List<String> rowTexts = new ArrayList<>();
-            collectVisibleTexts(rowView, rowTexts, 10);
+            collectVisibleTexts(rowView, rowTexts, 12);
             String rowTitle = !rowTexts.isEmpty() ? rowTexts.get(0) : null;
 
             // Strategy D: Match row texts against indexed thread summaries
@@ -734,7 +800,46 @@ public class UnsendAllMessagesHook {
 
     // ── 4. Context Menu Detection & Row Injection ────────────────────────────
 
+    /**
+     * Called from UIHookManager.setupHooks(activity) and Activity.onResume to register a persistent
+     * global layout listener on the Activity's decor view, matching RemoveMetaAIHook.watchActionSheet.
+     */
+    public static void watchActivity(final Activity activity) {
+        if (activity == null) return;
+        try {
+            Window w = activity.getWindow();
+            if (w == null) return;
+            View decor = w.getDecorView();
+            watchDecorView(decor, false);
+        } catch (Throwable ignored) {}
+    }
+
+    private static void watchDecorView(final View decor, final boolean isDialogRoot) {
+        if (decor == null) return;
+        if (Boolean.TRUE.equals(sWatchedDecorViews.get(decor))) return;
+        sWatchedDecorViews.put(decor, Boolean.TRUE);
+        try {
+            decor.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
+                if (!FeatureFlags.unsendAllMessages) return;
+                tryInjectIntoMenu(decor, isDialogRoot);
+                sweepWindowManagerRoots();
+            });
+        } catch (Throwable ignored) {}
+    }
+
     private void hookMenuAttachmentAndDialogs(ClassLoader classLoader) {
+        // Watch all resumed Activities automatically
+        try {
+            XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (param.thisObject instanceof Activity act) {
+                        watchActivity(act);
+                    }
+                }
+            });
+        } catch (Throwable ignored) {}
+
         // Track shown Dialogs so we can inspect Dialog-hosted context menus and dismiss them cleanly
         try {
             XposedHelpers.findAndHookMethod(Dialog.class, "show", new XC_MethodHook() {
@@ -746,10 +851,33 @@ public class UnsendAllMessagesHook {
                     Window w = d.getWindow();
                     if (w != null) {
                         View decor = w.getDecorView();
+                        watchDecorView(decor, true);
                         scheduleMenuCheck(decor, true);
                     }
+                    scheduleAllWindowsSweep();
                 }
             });
+        } catch (Throwable ignored) {}
+
+        // Also hook PopupWindow in case Instagram displays context options in a PopupWindow
+        try {
+            XC_MethodHook popupHook = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (!FeatureFlags.unsendAllMessages) return;
+                    if (param.thisObject instanceof android.widget.PopupWindow pw) {
+                        View cv = pw.getContentView();
+                        if (cv != null) {
+                            View root = cv.getRootView();
+                            watchDecorView(root, true);
+                            scheduleMenuCheck(root, true);
+                        }
+                    }
+                    scheduleAllWindowsSweep();
+                }
+            };
+            XposedBridge.hookAllMethods(android.widget.PopupWindow.class, "showAtLocation", popupHook);
+            XposedBridge.hookAllMethods(android.widget.PopupWindow.class, "showAsDropDown", popupHook);
         } catch (Throwable ignored) {}
 
         // Hook View.onAttachedToWindow to catch bottom sheets / action sheets added inside the Activity
@@ -760,21 +888,16 @@ public class UnsendAllMessagesHook {
                 protected void afterHookedMethod(MethodHookParam param) {
                     if (!FeatureFlags.unsendAllMessages) return;
                     View v = (View) param.thisObject;
-                    int id = v.getId();
-                    if (id == View.NO_ID) {
-                        // Also check if a recent inbox interaction occurred within 3.5 seconds
-                        if (SystemClock.uptimeMillis() - sLastInboxInteractionMs < 3500L
-                                && v instanceof ViewGroup) {
-                            scheduleMenuCheck(v.getRootView(), false);
-                        }
-                        return;
-                    }
+                    if (!(v instanceof ViewGroup)) return;
                     ensureResourceIds(v.getContext());
+                    int id = v.getId();
                     if ((sActionSheetContainerId != 0 && id == sActionSheetContainerId)
                             || (sBottomSheetContainerId != 0 && id == sBottomSheetContainerId)
                             || (sDesignBottomSheetId != 0 && id == sDesignBottomSheetId)
-                            || (SystemClock.uptimeMillis() - sLastInboxInteractionMs < 3500L)) {
-                        scheduleMenuCheck(v.getRootView(), false);
+                            || (SystemClock.uptimeMillis() - sLastInboxInteractionMs < 6000L)) {
+                        View root = v.getRootView();
+                        watchDecorView(root, false);
+                        scheduleMenuCheck(root, false);
                     }
                 }
             });
@@ -791,62 +914,85 @@ public class UnsendAllMessagesHook {
         mainHandler.postDelayed(() -> {
             sPendingRoots.remove(root);
             tryInjectIntoMenu(root, isDialogRoot);
-        }, 70);
-        mainHandler.postDelayed(() -> tryInjectIntoMenu(root, isDialogRoot), 220);
+        }, 45);
+        mainHandler.postDelayed(() -> tryInjectIntoMenu(root, isDialogRoot), 150);
+        mainHandler.postDelayed(() -> tryInjectIntoMenu(root, isDialogRoot), 320);
+    }
+
+    private static void scheduleAllWindowsSweep() {
+        mainHandler.postDelayed(UnsendAllMessagesHook::sweepAllWindows, 45);
+        mainHandler.postDelayed(UnsendAllMessagesHook::sweepAllWindows, 140);
+        mainHandler.postDelayed(UnsendAllMessagesHook::sweepAllWindows, 300);
+        mainHandler.postDelayed(UnsendAllMessagesHook::sweepAllWindows, 550);
+    }
+
+    private static void sweepAllWindows() {
+        if (!FeatureFlags.unsendAllMessages) return;
+        try {
+            Activity act = UIHookManager.getCurrentActivity();
+            if (act != null && act.getWindow() != null) {
+                tryInjectIntoMenu(act.getWindow().getDecorView(), false);
+            }
+            Dialog d = sLastShownDialog.get();
+            if (d != null && d.isShowing() && d.getWindow() != null) {
+                tryInjectIntoMenu(d.getWindow().getDecorView(), true);
+            }
+            sweepWindowManagerRoots();
+        } catch (Throwable ignored) {}
+    }
+
+    @SuppressLint("PrivateApi")
+    private static void sweepWindowManagerRoots() {
+        try {
+            Class<?> wmgClass = Class.forName("android.view.WindowManagerGlobal");
+            Object wmg = wmgClass.getMethod("getInstance").invoke(null);
+            Field viewsField = wmgClass.getDeclaredField("mViews");
+            viewsField.setAccessible(true);
+            Object viewsObj = viewsField.get(wmg);
+            if (viewsObj instanceof List<?> views) {
+                for (int i = views.size() - 1; i >= 0; i--) {
+                    Object item = views.get(i);
+                    if (item instanceof View rootView && rootView.getVisibility() == View.VISIBLE) {
+                        watchDecorView(rootView, true);
+                        tryInjectIntoMenu(rootView, true);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
     }
 
     private static void tryInjectIntoMenu(View root, boolean isDialogRoot) {
-        if (!FeatureFlags.unsendAllMessages || root == null) return;
+        if (!FeatureFlags.unsendAllMessages || !(root instanceof ViewGroup rootGroup)) return;
+        if (root.getVisibility() != View.VISIBLE) return;
         try {
             if (root.findViewWithTag(MENU_ITEM_TAG) != null) return; // already injected
 
             Context ctx = root.getContext();
             ensureResourceIds(ctx);
 
-            boolean recentInboxTouch = (SystemClock.uptimeMillis() - sLastInboxInteractionMs) < 5000L;
-            boolean recentStoreLookup = (SystemClock.uptimeMillis() - sLastStoreLookupMs) < 3500L;
+            boolean recentInboxTouch = (SystemClock.uptimeMillis() - sLastInboxInteractionMs) < 8000L;
 
-            // Check if the inbox is currently on screen in the host Activity
-            Activity act = activityFromContext(ctx);
-            if (act == null) act = UIHookManager.getCurrentActivity();
-            boolean inboxOnScreen = isInboxVisible(act);
-
-            if (!recentInboxTouch && !inboxOnScreen && !recentStoreLookup) return;
-
-            // Locate the sheet container inside root
-            View sheetContainer = null;
-            if (sActionSheetContainerId != 0) {
-                sheetContainer = root.findViewById(sActionSheetContainerId);
-            }
-            if (sheetContainer == null && sBottomSheetContainerId != 0) {
-                sheetContainer = root.findViewById(sBottomSheetContainerId);
-            }
-            if (sheetContainer == null && sDesignBottomSheetId != 0) {
-                sheetContainer = root.findViewById(sDesignBottomSheetId);
-            }
-            if (sheetContainer == null && isDialogRoot && root instanceof ViewGroup) {
-                sheetContainer = root;
-            }
-            if (!(sheetContainer instanceof ViewGroup sheetGroup) || sheetGroup.getVisibility() != View.VISIBLE) {
-                return;
-            }
-            if (sheetGroup.findViewWithTag(MENU_ITEM_TAG) != null) return;
-
-            // Find the ViewGroup holding the option rows (Pin, Mute, Flag, Delete, etc.)
-            MenuTarget target = findMenuTarget(sheetGroup, recentInboxTouch);
+            // Find the ViewGroup holding the option rows (Pin, Mute, Flag, Delete, etc.) across rootGroup.
+            // Note: we do NOT short-circuit on root.findViewById(sActionSheetContainerId) because an
+            // Activity decorView can contain an old/hidden action_sheet_container while the active sheet
+            // is in bottom_sheet_container, design_bottom_sheet, or another child ViewGroup.
+            MenuTarget target = findMenuTarget(rootGroup, recentInboxTouch, isDialogRoot);
             if (target == null || target.sampleRow == null) return;
 
-            // Resolve the target threadId and title before injecting
-            final String threadId = resolveTargetThreadId(sheetGroup);
-            final Object threadKey = threadId != null ? sThreadKeyById.get(threadId) : sSelectedThreadKey;
-            final String threadTitle = resolveTargetThreadTitle(threadId, sheetGroup);
+            final ViewGroup menuContainer = target.rowListGroup;
+            if (menuContainer.findViewWithTag(MENU_ITEM_TAG) != null) return;
 
-            View unsendRow = buildUnsendMenuRow(sheetGroup.getContext(), target.sampleRow, v -> {
+            // Resolve the target threadId and title before injecting
+            final String threadId = resolveTargetThreadId(rootGroup);
+            final Object threadKey = threadId != null ? sThreadKeyById.get(threadId) : sSelectedThreadKey;
+            final String threadTitle = resolveTargetThreadTitle(threadId, rootGroup);
+
+            View unsendRow = buildUnsendMenuRow(menuContainer.getContext(), target.sampleRow, v -> {
                 dismissMenu(root);
                 final Activity hostAct = UIHookManager.getCurrentActivity() != null
                         ? UIHookManager.getCurrentActivity()
-                        : activityFromContext(sheetGroup.getContext());
-                final Context dialogCtx = hostAct != null ? hostAct : sheetGroup.getContext();
+                        : activityFromContext(menuContainer.getContext());
+                final Context dialogCtx = hostAct != null ? hostAct : menuContainer.getContext();
                 mainHandler.postDelayed(() -> {
                     String resolvedId = threadId != null ? threadId : resolveTargetThreadId(null);
                     Object resolvedKey = threadKey != null ? threadKey
@@ -858,9 +1004,10 @@ public class UnsendAllMessagesHook {
                 }, 160);
             });
 
-            insertRowIntoTarget(target, unsendRow);
-            ModuleLog.line("(IE|UnsendAll) ✅ injected menu option for threadId=" + threadId
-                    + " title=" + threadTitle);
+            insertRowIntoTarget(target, unsendRow, rootGroup);
+            ModuleLog.line("(IE|UnsendAll) ✅ injected menu option into "
+                    + menuContainer.getClass().getSimpleName()
+                    + " for threadId=" + threadId + " title=" + threadTitle);
         } catch (Throwable t) {
             ModuleLog.line("(IE|UnsendAll) ⚠️ tryInjectIntoMenu: " + t.getMessage());
         }
@@ -879,12 +1026,12 @@ public class UnsendAllMessagesHook {
     }
 
     /**
-     * Scans the bottom sheet / dialog subtree for the ViewGroup whose children are the clickable
-     * option rows (e.g. Pin, Mute, Delete, Flag). Never touches the inbox RecyclerView itself.
+     * Scans the window / sheet subtree for the ViewGroup whose children are the thread context menu
+     * option rows (e.g. Pin, Mute, Delete, Flag, Mark as unread). Never touches the inbox RecyclerView.
      */
-    private static MenuTarget findMenuTarget(ViewGroup sheetRoot, boolean recentInboxTouch) {
+    private static MenuTarget findMenuTarget(ViewGroup rootGroup, boolean recentInboxTouch, boolean isDialogRoot) {
         ArrayDeque<ViewGroup> queue = new ArrayDeque<>();
-        queue.add(sheetRoot);
+        queue.add(rootGroup);
 
         ViewGroup bestContainer = null;
         View bestSampleRow = null;
@@ -893,60 +1040,89 @@ public class UnsendAllMessagesHook {
 
         while (!queue.isEmpty()) {
             ViewGroup vg = queue.poll();
-            if (vg == null || vg.getVisibility() != View.VISIBLE) continue;
+            if (vg == null || vg.getVisibility() != View.VISIBLE || !vg.isShown()) continue;
             if (sInboxRecyclerId != 0 && vg.getId() == sInboxRecyclerId) continue;
 
+            boolean inSheet = isInsideSheetContainer(vg, rootGroup, isDialogRoot);
+            boolean isRvOrList = isRecyclerViewOrListView(vg);
+
             int childCount = vg.getChildCount();
-            int optionRowCount = 0;
-            int keywordHits = 0;
-            View firstOptionRow = null;
-            View deleteRow = null;
-
-            for (int i = 0; i < childCount; i++) {
-                View child = vg.getChildAt(i);
-                if (child == null || child.getVisibility() != View.VISIBLE) continue;
-                if (MENU_ITEM_TAG.equals(child.getTag())) return null; // already has our row
-
-                TextView tv = findPrimaryTextView(child);
-                if (tv == null) continue;
-                CharSequence cs = tv.getText();
-                if (cs == null) continue;
-                String text = cs.toString().trim();
-                if (text.isEmpty() || text.length() > 60) continue;
-
-                boolean clickable = child.isClickable() || tv.isClickable()
-                        || vg.getClass().getName().contains("RecyclerView")
-                        || vg instanceof android.widget.ListView;
-                if (!clickable) continue;
-
-                optionRowCount++;
-                if (firstOptionRow == null) firstOptionRow = child;
-
-                String lower = text.toLowerCase(Locale.ROOT);
-                for (String kw : THREAD_MENU_KEYWORDS) {
-                    if (lower.equals(kw) || lower.startsWith(kw + " ") || lower.endsWith(" " + kw)) {
-                        keywordHits++;
-                        if (lower.contains("delete") || lower.contains("leave")) {
-                            deleteRow = child;
-                        }
-                        break;
-                    }
-                }
+            // Skip huge lists outside sheets (e.g., feed or inbox RecyclerView)
+            if (!inSheet && isRvOrList && childCount > 14) {
+                continue;
             }
 
-            if (optionRowCount >= 2 && (keywordHits >= 1 || (recentInboxTouch && optionRowCount <= 12))) {
-                int score = keywordHits * 10 + optionRowCount;
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestContainer = vg;
-                    bestSampleRow = deleteRow != null ? deleteRow : firstOptionRow;
-                    bestDeleteRow = deleteRow;
+            if (childCount >= 2 && childCount <= 20) {
+                int optionRowCount = 0;
+                int keywordHits = 0;
+                View firstOptionRow = null;
+                View deleteRow = null;
+                boolean isOwnDialog = false;
+
+                for (int i = 0; i < childCount; i++) {
+                    View child = vg.getChildAt(i);
+                    if (child == null || child.getVisibility() != View.VISIBLE) continue;
+                    if (MENU_ITEM_TAG.equals(child.getTag())) return null; // already has our row
+
+                    List<String> rowTexts = new ArrayList<>(4);
+                    collectVisibleTexts(child, rowTexts, 4);
+                    if (rowTexts.isEmpty()) continue;
+
+                    for (String rt : rowTexts) {
+                        if (rt.startsWith("InstaEclipse")
+                                || rt.equals("Unsend All Messages?")
+                                || rt.startsWith("Unsending Messages")) {
+                            isOwnDialog = true;
+                            break;
+                        }
+                    }
+                    if (isOwnDialog) break;
+
+                    boolean matchedKeyword = false;
+                    for (String rt : rowTexts) {
+                        String lower = rt.toLowerCase(Locale.ROOT);
+                        for (String kw : THREAD_MENU_KEYWORDS) {
+                            if (lower.equals(kw)
+                                    || lower.startsWith(kw + " ")
+                                    || lower.endsWith(" " + kw)
+                                    || lower.contains(" " + kw + " ")) {
+                                matchedKeyword = true;
+                                if (lower.contains("delete") || lower.contains("leave")) {
+                                    deleteRow = child;
+                                }
+                                break;
+                            }
+                        }
+                        if (matchedKeyword) break;
+                    }
+
+                    boolean interactiveRow = matchedKeyword || isRvOrList || isInteractive(child);
+                    if (!interactiveRow) continue;
+
+                    optionRowCount++;
+                    if (firstOptionRow == null) firstOptionRow = child;
+                    if (matchedKeyword) keywordHits++;
+                }
+
+                if (!isOwnDialog && optionRowCount >= 2 && optionRowCount <= 15) {
+                    boolean qualifies = (keywordHits >= 2)
+                            || (keywordHits >= 1 && (inSheet || recentInboxTouch))
+                            || (inSheet && recentInboxTouch && optionRowCount >= 3 && optionRowCount <= 10);
+                    if (qualifies) {
+                        int score = keywordHits * 15 + (inSheet ? 20 : 0) + optionRowCount;
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestContainer = vg;
+                            bestSampleRow = deleteRow != null ? deleteRow : firstOptionRow;
+                            bestDeleteRow = deleteRow;
+                        }
+                    }
                 }
             }
 
             for (int i = 0; i < childCount; i++) {
                 View c = vg.getChildAt(i);
-                if (c instanceof ViewGroup childVg) {
+                if (c instanceof ViewGroup childVg && c.getVisibility() == View.VISIBLE) {
                     queue.add(childVg);
                 }
             }
@@ -956,12 +1132,61 @@ public class UnsendAllMessagesHook {
         return new MenuTarget(bestContainer, bestSampleRow, bestDeleteRow);
     }
 
-    private static void insertRowIntoTarget(MenuTarget target, View unsendRow) {
-        ViewGroup listGroup = target.rowListGroup;
-        String clsName = listGroup.getClass().getName();
+    private static boolean isInsideSheetContainer(View v, View rootGroup, boolean isDialogRoot) {
+        for (android.view.ViewParent p = v instanceof ViewGroup ? (ViewGroup) v : v.getParent();
+             p instanceof View pv;
+             p = pv.getParent()) {
+            int id = pv.getId();
+            if ((sActionSheetContainerId != 0 && id == sActionSheetContainerId)
+                    || (sBottomSheetContainerId != 0 && id == sBottomSheetContainerId)
+                    || (sDesignBottomSheetId != 0 && id == sDesignBottomSheetId)) {
+                return true;
+            }
+            String cn = pv.getClass().getName();
+            if (cn.contains("BottomSheet") || cn.contains("ActionSheet")) {
+                return true;
+            }
+            if (pv == rootGroup) break;
+        }
+        if (isDialogRoot && rootGroup != null) {
+            Activity act = UIHookManager.getCurrentActivity();
+            if (act == null || act.getWindow() == null || act.getWindow().getDecorView() != rootGroup) {
+                return true; // separate Dialog / PopupWindow root
+            }
+        }
+        return false;
+    }
 
-        // Case 1: The option rows sit directly inside a vertical LinearLayout
-        if (listGroup instanceof LinearLayout ll && ll.getOrientation() == LinearLayout.VERTICAL) {
+    private static boolean isRecyclerViewOrListView(View v) {
+        if (v == null) return false;
+        if (v instanceof android.widget.AbsListView) return true;
+        for (Class<?> c = v.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            String name = c.getName();
+            if (name.contains("RecyclerView") || name.contains("ListView")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isInteractive(View v) {
+        if (v == null || v.getVisibility() != View.VISIBLE) return false;
+        if (v.isClickable() || v.isLongClickable() || v.hasOnClickListeners()) return true;
+        if (v instanceof ViewGroup vg) {
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                if (isInteractive(vg.getChildAt(i))) return true;
+            }
+        }
+        return false;
+    }
+
+    private static void insertRowIntoTarget(MenuTarget target, View unsendRow, ViewGroup rootGroup) {
+        ViewGroup listGroup = target.rowListGroup;
+
+        // Case 1: The option rows sit directly inside a vertical LinearLayout (not a RecyclerView)
+        if (listGroup instanceof LinearLayout ll
+                && ll.getOrientation() == LinearLayout.VERTICAL
+                && !isRecyclerViewOrListView(listGroup)) {
             if (target.deleteRow != null && target.deleteRow.getParent() == ll) {
                 int idx = ll.indexOfChild(target.deleteRow);
                 ll.addView(unsendRow, Math.min(idx + 1, ll.getChildCount()));
@@ -971,42 +1196,46 @@ public class UnsendAllMessagesHook {
             return;
         }
 
-        // Case 2: The option rows sit inside a RecyclerView or ListView — walk up to the nearest
-        // vertical LinearLayout inside the bottom sheet container and insert right below/above it.
+        // Case 2: The option rows sit inside a RecyclerView or ListView.
+        // Walk up ancestors inside the sheet to find a vertical LinearLayout (e.g. the sheet
+        // container holding the drag handle/header + RecyclerView) and insert unsendRow right
+        // ABOVE the RecyclerView (at idx) so it is always visible on screen and never clipped!
         View childInLinear = listGroup;
         View current = listGroup;
-        for (int depth = 0; depth < 5 && current.getParent() instanceof ViewGroup parent; depth++) {
-            if (parent instanceof LinearLayout ll && ll.getOrientation() == LinearLayout.VERTICAL) {
+        for (int depth = 0; depth < 6 && current != rootGroup && current.getParent() instanceof ViewGroup parent; depth++) {
+            if (parent instanceof LinearLayout ll
+                    && ll.getOrientation() == LinearLayout.VERTICAL
+                    && !isRecyclerViewOrListView(parent)) {
                 int idx = ll.indexOfChild(childInLinear);
-                ViewGroup.LayoutParams childLp = childInLinear.getLayoutParams();
-                if (childLp instanceof LinearLayout.LayoutParams llp && llp.height == ViewGroup.LayoutParams.MATCH_PARENT && llp.weight == 0f) {
-                    llp.height = 0;
-                    llp.weight = 1f;
-                    childInLinear.setLayoutParams(llp);
-                }
-                ll.addView(unsendRow, Math.min(idx + 1, ll.getChildCount()));
+                ll.addView(unsendRow, Math.max(0, idx));
                 return;
             }
             childInLinear = parent;
             current = parent;
         }
 
-        // Case 3: Fallback — wrap listGroup in a vertical LinearLayout inside its parent
-        if (listGroup.getParent() instanceof ViewGroup parent && !clsName.contains("LinearLayout")) {
-            int idx = parent.indexOfChild(listGroup);
-            ViewGroup.LayoutParams origLp = listGroup.getLayoutParams();
-            parent.removeViewAt(idx);
+        // Case 3: Fallback when listGroup's parent is a FrameLayout / ConstraintLayout / CoordinatorLayout
+        // without an enclosing vertical LinearLayout. Never detach listGroup! Instead, add top padding
+        // to listGroup so its rows shift down by one row height, and overlay unsendRow at the top.
+        if (listGroup.getParent() instanceof ViewGroup parent) {
+            Context ctx = listGroup.getContext();
+            int rowH = target.sampleRow.getHeight() > 0 ? target.sampleRow.getHeight() : dp(ctx, 52);
+            listGroup.setClipToPadding(false);
+            listGroup.setPadding(
+                    listGroup.getPaddingLeft(),
+                    listGroup.getPaddingTop() + rowH,
+                    listGroup.getPaddingRight(),
+                    listGroup.getPaddingBottom());
+            try {
+                listGroup.scrollBy(0, -rowH);
+            } catch (Throwable ignored) {}
 
-            LinearLayout wrapper = new LinearLayout(listGroup.getContext());
-            wrapper.setOrientation(LinearLayout.VERTICAL);
-            if (origLp != null) wrapper.setLayoutParams(origLp);
-
-            LinearLayout.LayoutParams listLp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            wrapper.addView(listGroup, listLp);
-            wrapper.addView(unsendRow, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-            parent.addView(wrapper, idx);
+            ViewGroup.MarginLayoutParams lp = new ViewGroup.MarginLayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, rowH);
+            lp.topMargin = listGroup.getTop();
+            unsendRow.setLayoutParams(lp);
+            unsendRow.setElevation(dp(ctx, 4));
+            parent.addView(unsendRow);
         }
     }
 
@@ -1116,11 +1345,8 @@ public class UnsendAllMessagesHook {
         try {
             Dialog d = sLastShownDialog.get();
             if (d != null && d.isShowing()) {
-                Window w = d.getWindow();
-                if (w != null && w.getDecorView() == root) {
-                    d.dismiss();
-                    return;
-                }
+                d.dismiss();
+                return;
             }
         } catch (Throwable ignored) {}
 
@@ -1135,12 +1361,46 @@ public class UnsendAllMessagesHook {
 
     private static String resolveTargetThreadId(ViewGroup sheetGroup) {
         long now = SystemClock.uptimeMillis();
-        if (sSelectedThreadId != null && (now - sLastInboxInteractionMs) < 15_000L) {
+        if (sSelectedThreadId != null && (now - sLastInboxInteractionMs) < 20_000L) {
             return sSelectedThreadId;
         }
-        if (sLastStoreLookupThreadId != null && (now - sLastStoreLookupMs) < 10_000L) {
+        if (sLastStoreLookupThreadId != null && (now - sLastStoreLookupMs) < 12_000L) {
             return sLastStoreLookupThreadId;
         }
+        // Check if the active Dialog or Fragment holds a DirectThreadKey in its arguments/fields
+        try {
+            Dialog d = sLastShownDialog.get();
+            if (d != null) {
+                Object dtk = findDirectThreadKey(d, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 5);
+                String tid = extractThreadIdFromKey(dtk);
+                if (tid != null) {
+                    sThreadKeyById.put(tid, dtk);
+                    return tid;
+                }
+            }
+        } catch (Throwable ignored) {}
+        try {
+            Activity act = UIHookManager.getCurrentActivity();
+            if (act != null) {
+                Method getFm = act.getClass().getMethod("getSupportFragmentManager");
+                Object fm = getFm.invoke(act);
+                if (fm != null) {
+                    Object frags = fm.getClass().getMethod("getFragments").invoke(fm);
+                    if (frags instanceof List<?> list) {
+                        for (int i = list.size() - 1; i >= 0; i--) {
+                            Object frag = list.get(i);
+                            if (frag == null) continue;
+                            Object dtk = findDirectThreadKey(frag, 0, Collections.newSetFromMap(new IdentityHashMap<>()), 5);
+                            String tid = extractThreadIdFromKey(dtk);
+                            if (tid != null) {
+                                sThreadKeyById.put(tid, dtk);
+                                return tid;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
         // Check if the sheet itself has a header TextView matching a known thread title
         if (sheetGroup != null) {
             List<String> texts = new ArrayList<>();
@@ -1708,6 +1968,15 @@ public class UnsendAllMessagesHook {
         if (obj == null || depth > maxDepth || !seen.add(obj)) return null;
         String cn = obj.getClass().getName();
         if (cn.equals(DTK_CLASS) || cn.contains("DirectThreadKey")) return obj;
+        if (obj instanceof android.os.Bundle bundle) {
+            try {
+                for (String k : bundle.keySet()) {
+                    Object hit = findDirectThreadKey(bundle.get(k), depth + 1, seen, maxDepth);
+                    if (hit != null) return hit;
+                }
+            } catch (Throwable ignored) {}
+            return null;
+        }
         if (obj instanceof View v) {
             Object tag = v.getTag();
             if (tag != null) {
@@ -1716,12 +1985,13 @@ public class UnsendAllMessagesHook {
             }
         }
         boolean descend = cn.startsWith("X.") || cn.startsWith("com.instagram.")
-                || obj instanceof View;
+                || cn.startsWith("androidx.fragment.")
+                || obj instanceof View || obj instanceof Dialog;
         if (!descend) return null;
 
         for (Class<?> c = obj.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
             String cname = c.getName();
-            if (cname.startsWith("android.") || cname.startsWith("java.")) break;
+            if (cname.startsWith("java.")) break;
             for (Field f : c.getDeclaredFields()) {
                 if (Modifier.isStatic(f.getModifiers()) || f.getType().isPrimitive()) continue;
                 try {
@@ -1741,14 +2011,24 @@ public class UnsendAllMessagesHook {
             if (sThreadKeyById.containsKey(s)) return s;
             return null;
         }
+        if (obj instanceof android.os.Bundle bundle) {
+            try {
+                for (String k : bundle.keySet()) {
+                    String hit = findKnownThreadIdInGraph(bundle.get(k), depth + 1, seen, maxDepth);
+                    if (hit != null) return hit;
+                }
+            } catch (Throwable ignored) {}
+            return null;
+        }
         String cn = obj.getClass().getName();
         boolean descend = cn.startsWith("X.") || cn.startsWith("com.instagram.")
-                || obj instanceof View;
+                || cn.startsWith("androidx.fragment.")
+                || obj instanceof View || obj instanceof Dialog;
         if (!descend) return null;
 
         for (Class<?> c = obj.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
             String cname = c.getName();
-            if (cname.startsWith("android.") || cname.startsWith("java.")) break;
+            if (cname.startsWith("java.")) break;
             for (Field f : c.getDeclaredFields()) {
                 if (Modifier.isStatic(f.getModifiers()) || f.getType().isPrimitive()) continue;
                 try {
@@ -1782,11 +2062,16 @@ public class UnsendAllMessagesHook {
     }
 
     private static TextView findPrimaryTextView(View v) {
-        if (v instanceof TextView tv) return tv;
+        if (v == null || v.getVisibility() != View.VISIBLE) return null;
+        if (v instanceof TextView tv) {
+            CharSequence cs = tv.getText();
+            if (cs != null && !cs.toString().trim().isEmpty()) return tv;
+            return null;
+        }
         if (v instanceof ViewGroup vg) {
             for (int i = 0; i < vg.getChildCount(); i++) {
                 TextView found = findPrimaryTextView(vg.getChildAt(i));
-                if (found != null && found.getText() != null && found.getText().length() > 0) {
+                if (found != null) {
                     return found;
                 }
             }
@@ -1795,6 +2080,7 @@ public class UnsendAllMessagesHook {
     }
 
     private static ImageView findPrimaryImageView(View v) {
+        if (v == null || v.getVisibility() != View.VISIBLE) return null;
         if (v instanceof ImageView iv) return iv;
         if (v instanceof ViewGroup vg) {
             for (int i = 0; i < vg.getChildCount(); i++) {
@@ -1828,28 +2114,6 @@ public class UnsendAllMessagesHook {
                 collectVisibleTexts(vg.getChildAt(i), out, limit);
             }
         }
-    }
-
-    private static View findAncestorById(View v, int id) {
-        for (android.view.ViewParent p = v.getParent(); p instanceof View pv; p = pv.getParent()) {
-            if (pv.getId() == id) return pv;
-        }
-        return null;
-    }
-
-    private static boolean isInboxVisible(Activity a) {
-        if (a == null) return false;
-        ensureResourceIds(a);
-        if (sThreadHeaderId != 0 && a.findViewById(sThreadHeaderId) != null) return false;
-        if (sInboxRecyclerId != 0) {
-            View rv = a.findViewById(sInboxRecyclerId);
-            if (rv != null && rv.isShown()) return true;
-        }
-        if (sInboxActionBarId != 0) {
-            View ab = a.findViewById(sInboxActionBarId);
-            if (ab != null && ab.isShown()) return true;
-        }
-        return false;
     }
 
     @SuppressLint("DiscouragedApi")

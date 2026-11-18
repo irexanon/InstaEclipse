@@ -17,7 +17,7 @@ public class FeatureFlags {
     public static boolean keepEphemeralMessages = false;
     public static boolean permanentViewMode = false;
     public static boolean keepUnsentMessages = false;
-    public static boolean unsendAllMessages = false;
+    public static boolean unsendAllMessages = true;
 
     // Auto-clear cache
     public static boolean autoClearCache = false;

@@ -1251,8 +1251,12 @@ public class FeaturesFragment extends Fragment {
     // STAGING LOGIC
     // =========================================================
 
+    private boolean defaultStateForKey(String prefKey) {
+        return "unsendAllMessages".equals(prefKey) || "lockUseFingerprint".equals(prefKey);
+    }
+
     private void stageChange(String prefKey, boolean isChecked) {
-        if (localCache.getBoolean(prefKey, false) == isChecked) {
+        if (localCache.getBoolean(prefKey, defaultStateForKey(prefKey)) == isChecked) {
             stagedChanges.remove(prefKey);
         } else {
             stagedChanges.put(prefKey, isChecked);
@@ -1289,7 +1293,7 @@ public class FeaturesFragment extends Fragment {
     private boolean getCurrentState(String prefKey) {
         if (prefKey == null) return false;
         if (stagedChanges.containsKey(prefKey)) return stagedChanges.get(prefKey);
-        return localCache.getBoolean(prefKey, false);
+        return localCache.getBoolean(prefKey, defaultStateForKey(prefKey));
     }
 
     // =========================================================

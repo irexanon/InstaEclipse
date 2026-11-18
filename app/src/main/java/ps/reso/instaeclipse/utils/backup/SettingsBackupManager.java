@@ -29,6 +29,7 @@ public class SettingsBackupManager {
 
         s.put("permanentViewMode",       FeatureFlags.permanentViewMode);
         s.put("keepUnsentMessages",      FeatureFlags.keepUnsentMessages);
+        s.put("unsendAllMessages",       FeatureFlags.unsendAllMessages);
 
         // Quick Toggles
         s.put("quickToggleSeen",         FeatureFlags.quickToggleSeen);
@@ -113,6 +114,7 @@ public class SettingsBackupManager {
         if (s.has("keepEphemeralMessages"))    FeatureFlags.keepEphemeralMessages    = s.getBoolean("keepEphemeralMessages");
         if (s.has("permanentViewMode"))        FeatureFlags.permanentViewMode        = s.getBoolean("permanentViewMode");
         if (s.has("keepUnsentMessages"))       FeatureFlags.keepUnsentMessages       = s.getBoolean("keepUnsentMessages");
+        if (s.has("unsendAllMessages"))        FeatureFlags.unsendAllMessages        = s.getBoolean("unsendAllMessages");
 
         if (s.has("quickToggleSeen"))        FeatureFlags.quickToggleSeen        = s.getBoolean("quickToggleSeen");
         if (s.has("quickToggleTyping"))      FeatureFlags.quickToggleTyping      = s.getBoolean("quickToggleTyping");

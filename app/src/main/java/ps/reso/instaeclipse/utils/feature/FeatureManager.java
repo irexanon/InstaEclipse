@@ -74,6 +74,12 @@ public class FeatureManager {
             FeatureStatusTracker.setDisabled("KeepUnsentMessages");
         }
 
+        if (FeatureFlags.unsendAllMessages) {
+            FeatureStatusTracker.setEnabled("UnsendAllMessages", R.string.ig_dialog_ghost_unsend_all);
+        } else {
+            FeatureStatusTracker.setDisabled("UnsendAllMessages");
+        }
+
         // Auto-Clear Cache is a filesystem operation (clears IG's cache dirs on background),
         // not an Instagram-code hook, so it has no meaningful ✅/❌ "hooked" state — intentionally
         // omitted from the load toast (it was always showing a ❌ despite working).

@@ -791,7 +791,8 @@ public class DialogUtils {
                 createSwitch(context, R.drawable.ic_eye_off, "#5E5CE6", I18n.t(context, R.string.ig_dialog_ghost_hide_view_once),       FeatureFlags.isGhostViewOnce),
                 createSwitch(context, R.drawable.ic_eye, "#5E5CE6", I18n.t(context, R.string.ig_dialog_ghost_permanent_view_once),  FeatureFlags.permanentViewMode),
                 createSwitch(context, R.drawable.ic_timer, "#5E5CE6", I18n.t(context, R.string.ig_dialog_ghost_keep_disappearing),    FeatureFlags.keepEphemeralMessages),
-                createSwitch(context, R.drawable.ic_chat, "#5E5CE6", I18n.t(context, R.string.ig_dialog_ghost_keep_unsent),         FeatureFlags.keepUnsentMessages)};
+                createSwitch(context, R.drawable.ic_chat, "#5E5CE6", I18n.t(context, R.string.ig_dialog_ghost_keep_unsent),         FeatureFlags.keepUnsentMessages),
+                createSwitch(context, R.drawable.ic_delete, "#5E5CE6", I18n.t(context, R.string.ig_dialog_ghost_unsend_all),        FeatureFlags.unsendAllMessages)};
 
         layout.addView(createActionRow(context, R.drawable.ic_chat, I18n.t(context, R.string.ig_dialog_unsent_title), "#5E5CE6", v -> showUnsentMessages(context)));
         layout.addView(createActionRow(context, R.drawable.ic_tune, I18n.t(context, R.string.ig_dialog_customize_quick_toggle), "#5E5CE6", v -> showGhostQuickToggleOptions(context)));
@@ -846,6 +847,9 @@ public class DialogUtils {
                         break;
                     case 9:
                         FeatureFlags.keepUnsentMessages = isChecked;
+                        break;
+                    case 10:
+                        FeatureFlags.unsendAllMessages = isChecked;
                         break;
                 }
 

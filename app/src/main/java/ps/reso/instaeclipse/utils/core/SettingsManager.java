@@ -33,6 +33,7 @@ public class SettingsManager {
         editor.putBoolean("keepEphemeralMessages", FeatureFlags.keepEphemeralMessages);
         editor.putBoolean("permanentViewMode", FeatureFlags.permanentViewMode);
         editor.putBoolean("keepUnsentMessages", FeatureFlags.keepUnsentMessages);
+        editor.putBoolean("unsendAllMessages", FeatureFlags.unsendAllMessages);
         editor.putBoolean("autoClearCache", FeatureFlags.autoClearCache);
         editor.putInt("autoClearCacheSizeMb", FeatureFlags.autoClearCacheSizeMb);
         editor.putBoolean("removeMetaAI", FeatureFlags.removeMetaAI);
@@ -139,6 +140,7 @@ public class SettingsManager {
         FeatureFlags.keepEphemeralMessages = prefs.getBoolean("keepEphemeralMessages", false);
         FeatureFlags.permanentViewMode = prefs.getBoolean("permanentViewMode", false);
         FeatureFlags.keepUnsentMessages = prefs.getBoolean("keepUnsentMessages", false);
+        FeatureFlags.unsendAllMessages = prefs.getBoolean("unsendAllMessages", false);
         FeatureFlags.autoClearCache = prefs.getBoolean("autoClearCache", false);
         FeatureFlags.autoClearCacheSizeMb = prefs.getInt("autoClearCacheSizeMb", 500);
         FeatureFlags.removeMetaAI = prefs.getBoolean("removeMetaAI", false);

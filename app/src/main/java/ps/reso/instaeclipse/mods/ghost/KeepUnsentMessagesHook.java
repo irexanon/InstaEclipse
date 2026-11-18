@@ -211,11 +211,37 @@ public class KeepUnsentMessagesHook {
     }
 
     // ── 1. LIVE removal: no-op + capture the id ──────────────────────────────────
+    /** Message ids explicitly unsent by the current user via UnsendAllMessagesHook. */
+    private static final Set<String> selfUnsentIds = Collections.synchronizedSet(new LinkedHashSet<String>() {
+        @Override public boolean add(String e) {
+            if (size() >= 2000) { java.util.Iterator<String> it = iterator(); if (it.hasNext()) { it.next(); it.remove(); } }
+            return super.add(e);
+        }
+    });
+
+    /** Allow local removal of a message id that the user explicitly unsent, and purge it from kept caches. */
+    public static void allowAndPurgeSelfUnsent(String itemId) {
+        if (itemId == null || itemId.isEmpty()) return;
+        selfUnsentIds.add(itemId);
+        protectedIds.remove(itemId);
+        threadIdByMsg.remove(itemId);
+        synchronized (keptByThread) {
+            for (java.util.Map<String, Object> owned : keptByThread.values()) {
+                if (owned != null) owned.remove(itemId);
+            }
+        }
+    }
+
     private void hookRemovePrimitive(DexKitBridge bridge, ClassLoader classLoader) {
         XC_MethodHook hook = new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 if (!FeatureFlags.keepUnsentMessages) return;
+                for (Object a : param.args) {
+                    if (a instanceof String && selfUnsentIds.contains(a)) {
+                        return; // allow local removal for self-unsent messages
+                    }
+                }
                 // Record the message-id String arg(s) (GYr/GYs pass id as the String params).
                 String threadId = param.args.length > 0 ? threadIdOf(param.args[0]) : null;
                 StringBuilder ids = new StringBuilder();

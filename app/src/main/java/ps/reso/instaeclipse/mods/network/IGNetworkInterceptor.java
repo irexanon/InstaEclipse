@@ -217,6 +217,10 @@ public class IGNetworkInterceptor {
                                         FeatureStatusTracker.setHooked("FollowerToast");
                                         FollowStatusHook.handleRequest(uri, param.args);
                                     }
+
+                                    // Capture session headers for Unsend All Messages (throttled internally)
+                                    ps.reso.instaeclipse.mods.ghost.UnsendAllMessagesHook
+                                            .captureSessionFromTigon(param.thisObject, requestObj, uri);
                                 }
                               } catch (Throwable ignored) {
                                   // A malformed/opaque request must never crash IG's network dispatch.

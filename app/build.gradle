@@ -16,9 +16,49 @@ android {
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        release {
+            def ksPath = System.getenv("KEYSTORE_PATH") ?: "${rootProject.projectDir}/release.keystore"
+            def ksFile = file(ksPath)
+            def ksPass = System.getenv("KEYSTORE_PASSWORD") ?: "instaeclipse"
+            def kAlias = System.getenv("KEY_ALIAS") ?: "instaeclipse"
+            def kPass  = System.getenv("KEY_PASSWORD") ?: ksPass
+
+            if (!ksFile.exists()) {
+                try {
+                    ksFile.parentFile?.mkdirs()
+                    def javaHome = System.getProperty("java.home")
+                    def keytoolBin = file("${javaHome}/bin/keytool").exists()
+                            ? "${javaHome}/bin/keytool"
+                            : "keytool"
+                    def proc = [
+                            keytoolBin, "-genkeypair", "-v",
+                            "-keystore", ksFile.absolutePath,
+                            "-alias", kAlias,
+                            "-keyalg", "RSA",
+                            "-keysize", "2048",
+                            "-validity", "10000",
+                            "-storepass", ksPass,
+                            "-keypass", kPass,
+                            "-dname", "CN=InstaEclipse, OU=Dev, O=InstaEclipse, L=Unknown, S=Unknown, C=US"
+                    ].execute()
+                    proc.waitFor()
+                } catch (Exception ignored) {}
+            }
+
+            if (ksFile.exists()) {
+                storeFile ksFile
+                storePassword ksPass
+                keyAlias kAlias
+                keyPassword kPass
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
+            signingConfig signingConfigs.release.storeFile != null ? signingConfigs.release : signingConfigs.debug
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }

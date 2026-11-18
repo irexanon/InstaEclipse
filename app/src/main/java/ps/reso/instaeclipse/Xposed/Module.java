@@ -265,6 +265,12 @@ public class Module implements IXposedHookLoadPackage, IXposedHookZygoteInit {
                     }
 
                     try {
+                        new ps.reso.instaeclipse.mods.ghost.UnsendAllMessagesHook().install(dexKitBridge, lpparam.classLoader); // Unsend All Messages
+                    } catch (Throwable ignored) {
+                        ModuleLog.line("(InstaEclipse | UnsendAll): ❌ Failed to hook");
+                    }
+
+                    try {
                         new ps.reso.instaeclipse.mods.ui.CustomFontHook().install(lpparam.classLoader); // Custom UI font
                     } catch (Throwable ignored) {
                         ModuleLog.line("(InstaEclipse | CustomFont): ❌ Failed to hook");
